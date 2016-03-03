@@ -63,6 +63,25 @@ func (r *Resolver) ResolveErr(qname string, qtype string) (RRs, error) {
 	return r.resolve(toLowerFQDN(qname), qtype, 0)
 }
 
+// ResolveFQDN finds DNS A records for the domain qname.
+// For nonexistent domains (NXDOMAIN), it will return an empty, non-nil slice.
+func (r *Resolver) ResolveFQDN(qname string) RRs {
+	rrs, err := r.resolveFQDN(toLowerFQDN(qname))
+	if err == NXDOMAIN {
+		return emptyRRs
+	}
+	if err != nil {
+		return nil
+	}
+	return rrs
+}
+
+// ResolveFQDNErr finds DNS A records for the domain qname.
+// For nonexistent domains, it will return an NXDOMAIN error.
+func (r *Resolver) ResolveFQDNErr(qname string) (RRs, error) {
+	return r.resolveFQDN(toLowerFQDN(qname))
+}
+
 func (r *Resolver) resolve(qname string, qtype string, depth int) (RRs, error) {
 	if depth++; depth > MaxRecursion {
 		logMaxRecursion(qname, qtype, depth)
@@ -124,7 +143,7 @@ func (r *Resolver) iterateParents(qname string, qtype string, depth int) (RRs, e
 			}
 
 			go func(host string) {
-				rrs, err := r.exchange(host, qname, qtype, depth)
+				rrs, _, err := r.exchange(host, qname, qtype, depth)
 				if err != nil {
 					chanErrs <- err
 				} else {
@@ -164,7 +183,86 @@ func (r *Resolver) iterateParents(qname string, qtype string, depth int) (RRs, e
 	return nil, ErrNoResponse
 }
 
-func (r *Resolver) exchange(host string, qname string, qtype string, depth int) (RRs, error) {
+func (r *Resolver) resolveFQDN(qname string) (RRs, error) {
+	rrs, err := r.cacheGet(qname, "A")
+	if err != nil {
+		return nil, err
+	}
+	if len(rrs) > 0 {
+		return rrs, nil
+	}
+	logResolveStart(qname, "A", 1)
+	start := time.Now()
+	nrrs, err := r.cacheGet(".", "NS")
+	if err != nil {
+		return nil, err
+	}
+	rrs, err = r.iterateNS(qname, nrrs, "A", 1)
+	logResolveEnd(qname, "A", rrs, 1, start, err)
+	return rrs, err
+}
+
+func (r *Resolver) iterateNS(qname string, nrrs RRs, qtype string, depth int) (RRs, error) {
+	chanARRs := make(chan RRs, MaxNameservers)
+	chanRRs := make(chan RRs, MaxNameservers)
+	chanErrs := make(chan error, MaxNameservers)
+
+	// Early out for specific queries
+	if len(nrrs) > 0 && qtype != "" {
+		rrs, err := r.cacheGet(qname, qtype)
+		if err != nil {
+			return nil, err
+		}
+		if len(rrs) > 0 {
+			return rrs, nil
+		}
+	}
+
+	// Query all nameservers in parallel
+	count := 0
+	for _, nrr := range nrrs {
+		if nrr.Type != "NS" {
+			continue
+		}
+
+		go func(host string) {
+			rrs, arrs, err := r.exchange(host, qname, qtype, depth)
+			if err != nil {
+				chanErrs <- err
+			} else if rrs != nil {
+				chanRRs <- rrs
+			} else if arrs != nil {
+				chanARRs <- arrs
+			}
+		}(nrr.Value)
+
+		count++
+		if count >= MaxNameservers {
+			break
+		}
+	}
+
+	select {
+	case rrs := <-chanRRs:
+		for _, nrr := range nrrs {
+			if nrr.Name == qname {
+				rrs = append(rrs, nrr)
+			}
+		}
+		depth++
+		return r.resolveCNAMEs(qname, qtype, rrs, depth)
+	case arrs := <-chanARRs:
+		depth++
+		return r.iterateNS(qname, arrs, qtype, depth)
+	case err := <-chanErrs:
+		if err == NXDOMAIN {
+			return nil, err
+		}
+	}
+	return nil, ErrNoResponse
+}
+
+func (r *Resolver) exchange(host string, qname string, qtype string, depth int) (RRs, RRs, error) {
 	dtype := dns.StringToType[qtype]
 	if dtype == 0 {
 		dtype = dns.TypeA
@@ -177,7 +275,7 @@ func (r *Resolver) exchange(host string, qname string, qtype string, depth int) 
 	count := 0
 	arrs, err := r.resolve(host, "A", depth)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, arr := range arrs {
 		if arr.Type != "A" { // FIXME: support AAAA records?
@@ -186,7 +284,7 @@ func (r *Resolver) exchange(host string, qname string, qtype string, depth int) 
 
 		// Never query more than MaxIPs for any nameserver
 		if count++; count > MaxIPs {
-			return nil, ErrMaxIPs
+			return nil, nil, ErrMaxIPs
 		}
 
 		// Synchronously query this DNS server
@@ -200,19 +298,27 @@ func (r *Resolver) exchange(host string, qname string, qtype string, depth int) 
 		// FIXME: cache NXDOMAIN responses responsibly
 		if rmsg.Rcode == dns.RcodeNameError {
 			r.cache.addNX(qname)
-			return nil, NXDOMAIN
+			return nil, nil, NXDOMAIN
 		} else if rmsg.Rcode != dns.RcodeSuccess {
-			return nil, errors.New(dns.RcodeToString[rmsg.Rcode])
+			return nil, nil, errors.New(dns.RcodeToString[rmsg.Rcode])
 		}
 
 		// Cache records returned
 		rrs := r.saveDNSRR(host, qname, append(append(rmsg.Answer, rmsg.Ns...), rmsg.Extra...))
 
+		var nsRrs RRs
+		for _, drr := range rmsg.Ns {
+			rr, ok := convertRR(drr)
+			if !ok {
+				continue
+			}
+			nsRrs = append(nsRrs, rr)
+		}
 		// Return after first successful network request
-		return rrs, nil
+		return rrs, nsRrs, nil
 	}
 
-	return nil, ErrNoARecords
+	return nil, nil, ErrNoARecords
 }
 
 func (r *Resolver) resolveCNAMEs(qname string, qtype string, crrs RRs, depth int) (RRs, error) {
