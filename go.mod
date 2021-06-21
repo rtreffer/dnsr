@@ -1,4 +1,4 @@
-module github.com/domainr/dnsr
+module github.com/rtreffer/dnsr
 
 require (
 	github.com/miekg/dns v1.1.42
